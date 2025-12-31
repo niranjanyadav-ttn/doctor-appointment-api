@@ -1,0 +1,29 @@
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: doctor_appointments_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: doctor_appointments
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD: apppassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      timeout: 20s
+      retries: 10
+      interval: 10s
+    networks:
+      - doctor_app_network
+
+volumes:
+  mysql_data:
+
+networks:
+  doctor_app_network:
+    driver: bridge
