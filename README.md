@@ -19,6 +19,10 @@ A production-ready RESTful API for managing doctor appointments with JWT authent
 - [API Documentation](#-api-documentation)
 - [API Endpoints](#-api-endpoints)
 - [Authentication](#-authentication)
+- [Authentication Flow & Design](#-authentication-flow--design)
+- [RBAC Design](#-role-based-access-control-rbac-design)
+- [Double-Booking Prevention](#-double-booking-prevention-logic)
+- [Security Best Practices](#-security-best-practices-implemented)
 - [Database Schema](#-database-schema)
 - [Testing](#-testing)
 - [Docker Deployment](#-docker-deployment)
@@ -132,7 +136,7 @@ A production-ready RESTful API for managing doctor appointments with JWT authent
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/doctor-appointment-api.git
+git clone https://github.com/niranjanyadav-ttn/doctor-appointment-api.git
 cd doctor-appointment-api
 ```
 
@@ -180,11 +184,7 @@ nano .env
 
 ### 6. Initialize Database
 
-The database tables will be created automatically when you start the application. Alternatively, you can create them manually:
-
-```bash
-python create_tables.py
-```
+The database tables will be created automatically when you start the application.
 
 ---
 
@@ -331,6 +331,353 @@ Authorization: Bearer <your-token-here>
   - Can book appointments
   - Can cancel their appointments
   - Cannot set availability
+
+---
+
+## 🔐 Authentication Flow & Design
+
+### JWT Authentication Flow
+
+```
+Step 1: User Registration
+--------------------------
+Client                                    Server
+  |                                         |
+  | POST /auth/register                     |
+  | {email, password, name, role}           |
+  |---------------------------------------->|
+  |                                         |
+  |                        Hash password    |
+  |                        Store in DB      |
+  |                                         |
+  | Return user (without password)          |
+  |<----------------------------------------|
+
+
+Step 2: User Login
+-------------------
+Client                                    Server
+  |                                         |
+  | POST /auth/login                        |
+  | {email, password}                       |
+  |---------------------------------------->|
+  |                                         |
+  |                        Verify password  |
+  |                        Generate JWT     |
+  |                                         |
+  | Return JWT token                        |
+  |<----------------------------------------|
+
+
+Step 3: Authenticated Request
+------------------------------
+Client                                    Server
+  |                                         |
+  | GET /doctors/my-appointments            |
+  | Authorization: Bearer <token>           |
+  |---------------------------------------->|
+  |                                         |
+  |                        Decode JWT       |
+  |                        Verify token     |
+  |                        Check role       |
+  |                        Get user data    |
+  |                                         |
+  | Return appointments                     |
+  |<----------------------------------------|
+```
+
+### Authentication Components
+
+#### 1. Password Security
+- **Hashing Algorithm:** Bcrypt with 12 rounds
+- **Password Requirements:** Minimum 8 characters
+- **Storage:** Only hashed passwords stored, never plaintext
+- **Verification:** Constant-time comparison to prevent timing attacks
+
+**Password hashing implementation:**
+
+```python
+def get_password_hash(password: str) -> str:
+    password_bytes = password.encode('utf-8')[:72]  # Bcrypt limit
+    salt = bcrypt.gensalt(rounds=12)
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
+```
+
+#### 2. JWT Token Structure
+
+```json
+{
+  "sub": "user@example.com",      // Subject (user identifier)
+  "role": "Doctor",                // User role for RBAC
+  "exp": 1704067200                // Expiration timestamp
+}
+```
+
+- **Algorithm:** HS256 (HMAC with SHA-256)
+- **Expiration:** 30 minutes (configurable)
+- **Secret Key:** Stored in environment variables
+- **Payload:** Contains user email and role for authorization
+
+#### 3. Token Validation Process
+
+1. Extract token from `Authorization: Bearer <token>` header
+2. Decode JWT using secret key
+3. Verify token signature
+4. Check expiration timestamp
+5. Extract user information from payload
+6. Query database to get current user state
+7. Return authenticated user object
+
+---
+
+## 👥 Role-Based Access Control (RBAC) Design
+
+### Role Hierarchy
+
+```
+User (Base)
+├── id
+├── email
+├── name
+├── password_hash
+└── role
+    ├── DOCTOR
+    │   ├── Can set availability
+    │   ├── Can view their appointments
+    │   └── Cannot book appointments
+    │
+    └── PATIENT
+        ├── Can view all doctors
+        ├── Can book appointments
+        ├── Can cancel their appointments
+        └── Cannot set availability
+```
+
+### Permission Matrix
+
+| Action | Endpoint | Doctor | Patient | Public |
+|--------|----------|--------|---------|--------|
+| Register User | `POST /auth/register` | ✅ | ✅ | ✅ |
+| Login | `POST /auth/login` | ✅ | ✅ | ✅ |
+| View All Doctors | `GET /doctors` | ✅ | ✅ | ✅ |
+| View Doctor Availability | `GET /doctors/{id}/availability` | ✅ | ✅ | ✅ |
+| **Set Availability** | `POST /doctors/availability` | ✅ | ❌ | ❌ |
+| **View Doctor's Appointments** | `GET /doctors/my-appointments` | ✅ | ❌ | ❌ |
+| **Book Appointment** | `POST /appointments` | ❌ | ✅ | ❌ |
+| **Cancel Appointment** | `DELETE /appointments/{id}` | ❌ | ✅ | ❌ |
+| View My Appointments | `GET /appointments/my-appointments` | ✅ | ✅ | ❌ |
+
+### RBAC Implementation
+
+#### 1. Role Definition
+
+```python
+class UserRole(str, Enum):
+    """User roles for role-based access control."""
+    DOCTOR = "Doctor"
+    PATIENT = "Patient"
+```
+
+#### 2. Role Verification (Dependency Injection)
+
+```python
+async def get_current_doctor(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """Verify user has Doctor role."""
+    if current_user.role != UserRole.DOCTOR:
+        raise HTTPException(
+            status_code=403,
+            detail="Only doctors can access this endpoint"
+        )
+    return current_user
+```
+
+#### 3. Endpoint Protection
+
+```python
+@router.post("/doctors/availability")
+async def set_availability(
+    availability_data: AvailabilityCreate,
+    current_user: User = Depends(get_current_doctor),  # Role check here
+    db: AsyncSession = Depends(get_db)
+):
+    # Only executed if user is a Doctor
+    ...
+```
+
+### Authorization Flow Examples
+
+**Example 1: Patient Tries to Set Availability (Denied)**
+
+```
+POST /doctors/availability
+Authorization: Bearer <patient_jwt_token>
+
+Flow:
+1. Extract JWT token from header ✅
+2. Decode and verify token signature ✅
+3. Get user from database (Role: Patient) ✅
+4. Check if user.role == DOCTOR ❌
+5. Raise HTTPException(403, "Only doctors can access")
+
+Result: 403 Forbidden
+```
+
+**Example 2: Doctor Sets Availability (Allowed)**
+
+```
+POST /doctors/availability
+Authorization: Bearer <doctor_jwt_token>
+
+Flow:
+1. Extract JWT token from header ✅
+2. Decode and verify token signature ✅
+3. Get user from database (Role: Doctor) ✅
+4. Check if user.role == DOCTOR ✅
+5. Check for availability conflicts ✅
+6. Create availability slot ✅
+
+Result: 201 Created
+```
+
+### Resource Ownership Validation
+
+Patients can only cancel their own appointments:
+
+```python
+async def cancel_appointment(appointment_id: int, patient_id: int):
+    appointment = await get_appointment(appointment_id)
+
+    # Verify ownership
+    if appointment.patient_id != patient_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only cancel your own appointments"
+        )
+
+    # Proceed with cancellation
+    return await repository.cancel_appointment(appointment_id)
+```
+
+---
+
+## 🎯 Double-Booking Prevention Logic
+
+### How It Works
+
+The system implements a two-step validation process to prevent double-booking:
+
+#### Step 1: Availability Validation
+
+```python
+# Check if requested time slot is within doctor's availability
+availabilities = await get_doctor_availabilities(doctor_id)
+is_within_availability = False
+
+for availability in availabilities:
+    if (availability.start_time <= requested_start and 
+        availability.end_time >= requested_end):
+        is_within_availability = True
+        break
+
+if not is_within_availability:
+    raise HTTPException(400, "Time slot not within doctor's availability")
+```
+
+#### Step 2: Conflict Detection
+
+```python
+# Check for existing confirmed appointments that overlap
+existing_appointments = await get_doctor_appointments(
+    doctor_id=doctor_id,
+    status="confirmed"
+)
+
+for appointment in existing_appointments:
+    # Check if time slots overlap
+    if (requested_start < appointment.end_time and 
+        requested_end > appointment.start_time):
+        raise HTTPException(400, "This time slot is already booked")
+
+# No conflicts found - create appointment
+return await create_appointment(...)
+```
+
+### Overlap Detection Algorithm
+
+**Mathematical Condition for Overlapping:**
+```
+Appointment 1: [start1, end1]
+Appointment 2: [start2, end2]
+
+Overlap if: start2 < end1 AND end2 > start1
+```
+
+**Example Scenarios:**
+
+```
+Existing Appointment: [10:00, 11:00]
+
+Scenario 1: New [10:30, 11:30] → CONFLICT ❌ (overlaps)
+Scenario 2: New [11:00, 12:00] → SUCCESS ✅ (no overlap)
+Scenario 3: New [09:00, 10:00] → SUCCESS ✅ (no overlap)
+Scenario 4: New [09:30, 10:30] → CONFLICT ❌ (overlaps)
+Scenario 5: New [10:00, 11:00] → CONFLICT ❌ (exact match)
+```
+
+### Database-Level Protection
+
+The system uses database transactions and proper indexing to ensure data consistency:
+
+- Foreign key constraints ensure referential integrity
+- Indexed queries on `doctor_id`, `start_time`, and `status` for fast lookups
+- Async operations with proper transaction handling
+
+---
+
+## 🔒 Security Best Practices Implemented
+
+1. ✅ **Password Security**
+   - Bcrypt hashing with salt
+   - 12-round cost factor
+   - 72-byte limit compliance
+   - Constant-time verification
+
+2. ✅ **JWT Security**
+   - Secret key stored in environment variables
+   - Token expiration (30 minutes)
+   - Signature verification on every request
+   - HS256 algorithm
+
+3. ✅ **RBAC Implementation**
+   - Role stored in JWT payload
+   - Role verified on protected endpoints
+   - Cannot be forged or bypassed
+   - Resource ownership validation
+
+4. ✅ **Input Validation**
+   - Pydantic schemas validate all inputs
+   - Email format validation
+   - Password length requirements
+   - DateTime validation
+
+5. ✅ **Database Security**
+   - Parameterized queries (SQL injection prevention)
+   - Foreign key constraints
+   - Cascade deletion for data integrity
+   - Proper indexing for performance
+
+6. ✅ **Error Handling**
+   - No sensitive information in error messages
+   - Consistent error responses
+   - Proper HTTP status codes
+
+7. ✅ **Environment Security**
+   - Secrets in `.env` file (not committed)
+   - `.env.example` for documentation
+   - `.gitignore` prevents secret exposure
 
 ---
 
@@ -541,8 +888,7 @@ This project is licensed under the MIT License.
 
 **Niranjan Kumar Yadav**
 
-- GitHub: [@niranjankumaryadav](https://github.com/niranjankumaryadav)
-- Email: contact@example.com
+- GitHub: [@niranjanyadav-ttn](https://github.com/niranjanyadav-ttn)
 
 ---
 
